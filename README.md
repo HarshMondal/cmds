@@ -9,27 +9,13 @@ executed**. Tweak it (add a flag, change a port), press Enter, and *then* it run
 
   cmds> █
 ❯ uvicorn app.main:app --reload
-       dev server
   source .venv/bin/activate
-       activate venv
   pytest
-       run tests
 
-# pick uvicorn → it appears on your prompt, ready to edit:
-~/Documents/backend-api $ uvicorn app.main:app --reload --port 8001
-#                          └ edit freely, then press Enter to run
 ```
 
 No more digging through shell history or the README to remember the exact venv path,
 module name, or flags for *this* project.
-
-## Why two Enters?
-
-1. **First Enter** — selects the command and inserts it onto your prompt.
-2. **Second Enter** — runs it (after any edits you make).
-
-Selection and execution are deliberately separate, so you never accidentally run
-something, and you're always free to adjust it first.
 
 ## How it works
 
