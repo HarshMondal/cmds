@@ -1,0 +1,263 @@
+#!/usr/bin/env bash
+#
+# cmds-core — storage + picker backend for `cmds`.
+#
+# This script does all the work that does NOT need to touch the live shell:
+# reading/writing the JSON store and running the fzf picker. It communicates
+# only via stdout / stderr / exit codes. The interactive prompt-insertion lives
+# in the `cmds` shell function (see shell/cmds.bash), which calls this script.
+#
+set -euo pipefail
+
+VERSION="0.1.0"
+
+STORE_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/cmds"
+STORE="$STORE_DIR/commands.json"
+
+# ---------------------------------------------------------------------------
+# helpers
+# ---------------------------------------------------------------------------
+
+die() { printf 'cmds: %s\n' "$1" >&2; exit 1; }
+
+require() {
+  command -v "$1" >/dev/null 2>&1 || die "missing dependency: $1 (install it and retry)"
+}
+
+ensure_store() {
+  mkdir -p "$STORE_DIR"
+  [ -f "$STORE" ] || printf '{}\n' > "$STORE"
+}
+
+# Key a project on its exact absolute directory (symlinks resolved).
+project_key() { pwd -P; }
+
+# Atomically rewrite the store: jq "$@" STORE > tmp ; mv tmp STORE.
+# Pass the jq filter and any --arg/--argjson flags as arguments.
+jq_write() {
+  local tmp
+  tmp="$(mktemp "${STORE}.XXXXXX")" || die "mktemp failed"
+  if jq "$@" "$STORE" > "$tmp"; then
+    mv -f "$tmp" "$STORE"
+  else
+    rm -f "$tmp"
+    die "store update failed"
+  fi
+}
+
+# How many commands are saved for the given key?
+count_for_key() {
+  jq -r --arg k "$1" '(.[$k].commands // []) | length' "$STORE"
+}
+
+# Render the commands for a key as a numbered, picker-friendly TSV:
+#   index<TAB>cmd  -  title
+# Used by the `edit` and `rm` choosers (returns field 1 = index).
+index_tsv() {
+  jq -r --arg k "$1" '
+    .[$k].commands | to_entries[] |
+    "\(.key)\t\(.value.cmd)"
+    + (if (.value.title // "") != "" then "  -  \(.value.title)" else "" end)
+  ' "$STORE"
+}
+
+# ---------------------------------------------------------------------------
+# subcommands
+# ---------------------------------------------------------------------------
+
+cmd_add() {
+  local cmd="" title=""
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      -t|--title)     title="${2:-}"; shift 2 ;;
+      -t=*|--title=*) title="${1#*=}"; shift ;;
+      --)             shift; [ "$#" -gt 0 ] && { cmd="$1"; shift; } ;;
+      -*)             die "unknown flag: $1" ;;
+      *)              if [ -z "$cmd" ]; then cmd="$1"; else die "unexpected argument: $1"; fi; shift ;;
+    esac
+  done
+  [ -n "$cmd" ] || die "usage: cmds add '<command>' [-t '<title>']"
+
+  ensure_store
+  local key exists
+  key="$(project_key)"
+  exists="$(jq -r --arg k "$key" --arg c "$cmd" \
+    '(.[$k].commands // []) | any(.cmd == $c)' "$STORE")"
+  if [ "$exists" = "true" ]; then
+    printf 'cmds: already saved for %s\n' "$key" >&2
+    return 0
+  fi
+
+  jq_write --arg k "$key" --arg c "$cmd" --arg t "$title" \
+    '.[$k].commands += [{cmd: $c, title: $t}]'
+  printf 'cmds: added to %s\n' "$key" >&2
+}
+
+cmd_list() {
+  ensure_store
+  local key n
+  key="$(project_key)"
+  n="$(count_for_key "$key")"
+  if [ "$n" -eq 0 ]; then
+    printf 'cmds: no commands saved for %s\n' "$key" >&2
+    return 1
+  fi
+  jq -r --arg k "$key" '
+    .[$k].commands | to_entries[] |
+    "\(.key + 1). \(.value.cmd)"
+    + (if (.value.title // "") != "" then "  (\(.value.title))" else "" end)
+  ' "$STORE"
+}
+
+cmd_pick() {
+  require fzf
+  ensure_store
+  local key n
+  key="$(project_key)"
+  n="$(count_for_key "$key")"
+  if [ "$n" -eq 0 ]; then
+    printf "cmds: no commands saved for %s — add one with: cmds add '<command>'\n" "$key" >&2
+    return 1
+  fi
+
+  # One command per line, numbered "N.<TAB>command" (no titles in the picker).
+  # Fuzzy search matches the command only (--nth=2). Bind digit keys to jump to
+  # that row and accept instantly — only for rows that exist, so out-of-range
+  # digits still type normally for fuzzy search.
+  local binds="" i
+  for ((i = 1; i <= n && i <= 9; i++)); do
+    binds+="${i}:pos(${i})+accept,"
+  done
+  binds="${binds%,}"
+
+  local sel
+  sel="$(
+    jq -r --arg k "$key" '.[$k].commands | to_entries[] | "\(.key + 1).\t\(.value.cmd)"' "$STORE" \
+    | fzf --height=40% --reverse --prompt='cmds> ' \
+          --delimiter='\t' --with-nth='1,2' --nth='2' \
+          --bind "$binds" \
+    | cut -f2-
+  )" || sel=""
+
+  [ -n "$sel" ] || return 1
+  printf '%s\n' "$sel"
+}
+
+cmd_edit() {
+  if [ "${1:-}" = "--raw" ]; then
+    ensure_store
+    "${EDITOR:-vi}" "$STORE"
+    return
+  fi
+
+  require fzf
+  ensure_store
+  local key n idx
+  key="$(project_key)"
+  n="$(count_for_key "$key")"
+  [ "$n" -gt 0 ] || die "no commands saved for $key"
+
+  idx="$(index_tsv "$key" \
+    | fzf --height=40% --reverse --prompt='edit> ' --delimiter='\t' --with-nth='2' \
+    | cut -f1)" || idx=""
+  [ -n "$idx" ] || return 1
+
+  local cur_cmd cur_title choice new
+  cur_cmd="$(jq -r --arg k "$key" --argjson i "$idx" '.[$k].commands[$i].cmd' "$STORE")"
+  cur_title="$(jq -r --arg k "$key" --argjson i "$idx" '.[$k].commands[$i].title // ""' "$STORE")"
+
+  printf 'editing: %s\n' "$cur_cmd" >&2
+  read -r -p '[c] command  [t] title  [d] delete  [q] cancel: ' choice
+  case "$choice" in
+    c|C)
+      IFS= read -r -e -i "$cur_cmd" -p 'command: ' new || return 1
+      [ -n "$new" ] || die "command cannot be empty"
+      jq_write --arg k "$key" --argjson i "$idx" --arg v "$new" '.[$k].commands[$i].cmd = $v'
+      printf 'cmds: command updated\n' >&2 ;;
+    t|T)
+      IFS= read -r -e -i "$cur_title" -p 'title: ' new || return 1
+      jq_write --arg k "$key" --argjson i "$idx" --arg v "$new" '.[$k].commands[$i].title = $v'
+      printf 'cmds: title updated\n' >&2 ;;
+    d|D)
+      jq_write --arg k "$key" --argjson i "$idx" 'del(.[$k].commands[$i])'
+      printf 'cmds: deleted\n' >&2 ;;
+    *)
+      printf 'cmds: cancelled\n' >&2 ;;
+  esac
+}
+
+cmd_rm() {
+  require fzf
+  ensure_store
+  local key n idx
+  key="$(project_key)"
+  n="$(count_for_key "$key")"
+  [ "$n" -gt 0 ] || die "no commands saved for $key"
+
+  idx="$(index_tsv "$key" \
+    | fzf --height=40% --reverse --prompt='delete> ' --delimiter='\t' --with-nth='2' \
+    | cut -f1)" || idx=""
+  [ -n "$idx" ] || return 1
+
+  jq_write --arg k "$key" --argjson i "$idx" 'del(.[$k].commands[$i])'
+  printf 'cmds: deleted\n' >&2
+}
+
+cmd_projects() {
+  ensure_store
+  local n
+  n="$(jq -r 'keys | length' "$STORE")"
+  if [ "$n" -eq 0 ]; then
+    printf 'cmds: no projects yet\n' >&2
+    return 0
+  fi
+  jq -r 'to_entries[] | "\(.value.commands | length)\t\(.key)"' "$STORE" \
+    | sort -rn \
+    | awk -F'\t' '{ printf "%3d  %s\n", $1, $2 }'
+}
+
+usage() {
+  cat <<'EOF'
+cmds — project-aware command picker
+
+Usage (via the `cmds` shell function):
+  cmds                            open the picker for the current directory
+  cmds add '<cmd>' [-t '<title>'] save a command (no args: save the last-run command)
+  cmds list                       list this directory's commands
+  cmds edit                       pick a command -> edit command / title, or delete
+  cmds edit --raw                 open the JSON store in $EDITOR
+  cmds rm                         pick a command to delete
+  cmds projects                   list all directories with saved commands
+  cmds help                       show this help
+  cmds version                    show version
+
+Commands are stored per exact directory in:
+  ~/.config/cmds/commands.json  (honors $XDG_CONFIG_HOME)
+EOF
+}
+
+# ---------------------------------------------------------------------------
+# dispatch
+# ---------------------------------------------------------------------------
+
+main() {
+  local sub="${1:-pick}"
+  shift || true
+  case "$sub" in
+    help|-h|--help)       usage; return 0 ;;
+    version|-V|--version) printf 'cmds %s\n' "$VERSION"; return 0 ;;
+  esac
+
+  require jq
+  case "$sub" in
+    pick)             cmd_pick "$@" ;;
+    add)              cmd_add "$@" ;;
+    list|ls)          cmd_list "$@" ;;
+    edit)             cmd_edit "$@" ;;
+    rm|remove|delete) cmd_rm "$@" ;;
+    projects)         cmd_projects "$@" ;;
+    *)                die "unknown subcommand: $sub (try: cmds help)" ;;
+  esac
+}
+
+main "$@"

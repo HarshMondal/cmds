@@ -1,0 +1,12 @@
+# Editor / OS cruft
+*.swp
+*.swo
+*~
+.DS_Store
+.idea/
+.vscode/
+
+# Test / runtime artifacts
+*.log
+tmp/
+.tmp/
