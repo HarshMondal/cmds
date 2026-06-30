@@ -7,6 +7,20 @@
 # running in your interactive shell can place text onto the prompt line for you
 # to edit before running it. The heavy lifting lives in `cmds-core`.
 
+# Echo the terminal cursor position as "row col" via a DSR query (ESC[6n), or
+# fail quietly if the terminal doesn't answer — the timeout means it can never
+# hang the shell, and callers treat "no answer" as "leave the screen alone".
+_cmds_cursor_pos() {
+  local reply row col to=0.2
+  [ "${BASH_VERSINFO[0]:-0}" -ge 4 ] || to=1   # fractional read -t needs bash 4+
+  # Send the query as read's prompt so echo is already off (-s) when the reply
+  # arrives — otherwise the ESC[row;colR reply can leak onto the screen.
+  IFS='[;' read -rsp $'\033[6n' -d R -t "$to" -a reply < /dev/tty || return 1
+  row="${reply[1]}"; col="${reply[2]}"
+  case "${row}-${col}" in *[!0-9-]*|-*|*-|'') return 1 ;; esac
+  printf '%s %s\n' "$row" "$col"
+}
+
 cmds() {
   case "${1:-}" in
     "")
@@ -19,7 +33,30 @@ cmds() {
       IFS= read -r -e -i "$sel" -p '› ' edited || return
       [ -n "$edited" ] || return
       history -s "$edited"   # so Up-arrow recalls what you just ran
-      eval "$edited"
+
+      # Mark where output begins with a dim divider, but only when there IS
+      # output. We can't capture eval's output (that would break `source`/`cd`,
+      # streaming servers, and TUIs, which all need the live shell and real TTY),
+      # so instead we print the marker, then erase it again if the cursor never moved.
+      local _cmds_rc
+      if [ -t 1 ] && [ -r /dev/tty ] && [ -w /dev/tty ]; then
+        local _start _end _srow _scol _erow _ecol _w _line
+        _w=${COLUMNS:-80}; printf -v _line '%*s' "$_w" ''
+        printf '\033[38;5;242m%s\033[0m\n' "${_line// /─}"
+        _start="$(_cmds_cursor_pos)"
+        eval "$edited"; _cmds_rc=$?
+        _end="$(_cmds_cursor_pos)"
+        if [ -n "$_start" ] && [ -n "$_end" ]; then
+          read -r _srow _scol <<<"$_start"
+          read -r _erow _ecol <<<"$_end"
+          if [ "$_erow" = "$_srow" ] && [ "$_ecol" = "$_scol" ]; then
+            printf '\033[1A\033[2K\r'        # no output => clear the marker
+          fi
+        fi
+      else
+        eval "$edited"; _cmds_rc=$?
+      fi
+      return "$_cmds_rc"
       ;;
     add)
       shift
